@@ -175,4 +175,5 @@ LOG_POLL_INTERVAL    = 120   # 日志刷新间隔(ms)
 因使用本工具产生的一切后果由使用者自行承担。
 
 留个赞赏码在这里，万一呢
-<img width="1248" height="1248" alt="IMG_8051" src="https://github.com/user-attachments/assets/e7540af9-bfca-44b3-af06-218562a9406a" />
+
+<img width="500" height="500" alt="IMG_8051" src="https://github.com/user-attachments/assets/3345d7b8-b327-4590-be41-d2da013d38a6" />
