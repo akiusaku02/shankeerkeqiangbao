@@ -174,4 +174,5 @@ LOG_POLL_INTERVAL    = 120   # 日志刷新间隔(ms)
 弹窗提示抢报成功不等于网页100%报名成功，请以二课网页实际报名结果为准。
 因使用本工具产生的一切后果由使用者自行承担。
 
----
+留个赞赏码在这里，万一呢
+<img width="1248" height="1248" alt="IMG_8051" src="https://github.com/user-attachments/assets/e7540af9-bfca-44b3-af06-218562a9406a" />
