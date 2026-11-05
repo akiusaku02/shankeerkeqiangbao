@@ -176,4 +176,4 @@ LOG_POLL_INTERVAL    = 120   # 日志刷新间隔(ms)
 
 留个赞赏码在这里，万一呢
 
-<img width="500" height="500" alt="IMG_8051" src="https://github.com/user-attachments/assets/3345d7b8-b327-4590-be41-d2da013d38a6" />
+<img width="200" height="200" alt="IMG_8051" src="https://github.com/user-attachments/assets/3345d7b8-b327-4590-be41-d2da013d38a6" />
