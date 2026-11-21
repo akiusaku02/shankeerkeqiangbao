@@ -1,18 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-山科二课抢报脚本 v0.2.4
+山科二课抢报脚本 v0.2.5
 更新：
-1.报名接口完全对齐抓包原始报文，替换网页端替代接口；修复http_post支持表单编码
-2.取消报名接口同步接口 activity/enroll/cancel/person
-3. 修复user_event_queue刷新事件堆积：重复refresh事件入队时丢弃旧事件，仅保留最新
-4. cred.json文件损坏容错，clear_stored_stable_auth增加JSON解析异常兜底
-5. get_activity_detail详情接口增加重试机制，网络抖动不会直接丢失活动
-6. 蹲守任务改进：抢到名额/蹲守耗尽弹出tk弹窗提示（后台线程走事件队列）
-7. day_to_ts抓取活动时间叠加服务器time_offset_ms，修复本地时钟不准导致抓取范围错误
-8. UI优化：学院/分类下拉框切换自动触发刷新，无需手动点按钮刷新
-9. HTTP增加401/403/429限流状态码识别，429触发休眠
-10. 后台循环定时持久化task.json，避免程序被强杀丢失内存中运行任务
-11. 添加加入队列时二次网络拉取详情校验活动真实状态，不完全依赖缓存detail
+1. 修复筛选后【加入队列】序号错用全量活动下标的问题：序号改为与筛选后显示列表一致，按活动ID加入
+2. 活动列表与抢报队列的序号统一改为从1开始
 """
 import requests
 import time
@@ -755,12 +746,14 @@ def backend_loop():
                 if ev_type == "refresh":
                     act_table_queue.put((cached_raw_activities, cached_dept_dict, detail_cache, task_list, worker_threads, time_offset_ms))
                 elif ev_type == "add":
-                    sel_indexes = ev_data
-                    for sel_idx in sel_indexes:
-                        if sel_idx <0 or sel_idx >= len(cached_raw_activities):
-                            logger.warning(f"序号{sel_idx}超出范围")
+                    # ev_data 为界面显示序号映射后的活动ID列表（已按筛选后列表换算）
+                    sel_ids = ev_data
+                    act_by_id = {str(it.get("id")): it for it in cached_raw_activities}
+                    for sel_id in sel_ids:
+                        selected = act_by_id.get(str(sel_id))
+                        if selected is None:
+                            logger.warning(f"活动ID {sel_id} 不在当前活动列表中（列表可能已刷新），请重新加入")
                             continue
-                        selected = cached_raw_activities[sel_idx]
                         aid = selected.get("id")
                         name = selected.get("name")
                         # 二次网络拉取详情，不使用缓存，校验真实状态
@@ -800,6 +793,7 @@ def backend_loop():
                     act_table_queue.put((cached_raw_activities, cached_dept_dict, detail_cache, task_list, worker_threads, time_offset_ms))
                 elif ev_type == "del":
                     del_indexes = sorted(ev_data, reverse=True)
+                    queue_len_now = len(task_list)
                     for d_idx in del_indexes:
                         if 0<= d_idx < len(task_list):
                             removed = task_list.pop(d_idx)
@@ -810,6 +804,8 @@ def backend_loop():
                                     task_stop_flags[aid].set()
                             save_tasks_atomic(task_list, task_list_lock)
                             logger.info(f"🗑️ 已删除队列任务：{removed['name']}，已通知盯防线程停止")
+                        else:
+                            logger.warning(f"删除队列：序号 {d_idx + 1} 超出范围（当前队列共 {queue_len_now} 条，序号从1开始）")
                     act_table_queue.put((cached_raw_activities, cached_dept_dict, detail_cache, task_list, worker_threads, time_offset_ms))
                 elif ev_type == "popup_msg":
                     pass
@@ -898,6 +894,8 @@ class DualWindowGUI:
         ttk.Label(frm_right, text="✅ 已加入抢报队列（删除看这里）").pack()
         self.txt_queue = scrolledtext.ScrolledText(frm_right, wrap=tk.WORD, font=("Consolas",9))
         self.txt_queue.pack(fill=tk.BOTH, expand=True)
+        # 当前界面展示（筛选后）的活动列表快照，加入队列时序号以它为准
+        self.current_show_list = []
         self.poll_log()
         self.poll_act_table()
     def apply_log_cfg(self):
@@ -928,11 +926,32 @@ class DualWindowGUI:
         raw = self.var_add.get().strip()
         if not raw:
             return
+        show_list = getattr(self, "current_show_list", []) or []
+        if not show_list:
+            logger.warning("加入队列：当前还没有活动列表，请先点【①刷新活动列表】")
+            self.var_add.set("")
+            return
         try:
             idx_list = [int(x) for x in raw.split()]
-            enqueue_user_event(("add", idx_list))
         except ValueError:
             logger.warning("加入队列：输入必须是数字，多个用空格隔开")
+            self.var_add.set("")
+            return
+        # 按界面上看到的序号（从1开始）取活动，再转成活动ID传给后台，避免筛选后序号错位
+        ids = []
+        bad_idx = []
+        for idx in idx_list:
+            pos = idx - 1
+            if 0 <= pos < len(show_list):
+                aid = show_list[pos].get("id")
+                if aid is not None:
+                    ids.append(aid)
+            else:
+                bad_idx.append(idx)
+        if bad_idx:
+            logger.warning(f"加入队列：序号 {bad_idx} 超出范围（当前筛选列表共 {len(show_list)} 条，序号从1开始）")
+        if ids:
+            enqueue_user_event(("add", ids))
         self.var_add.set("")
     def on_del_task(self):
         raw = self.var_del.get().strip()
@@ -940,9 +959,12 @@ class DualWindowGUI:
             return
         try:
             idx_list = [int(x) for x in raw.split()]
-            enqueue_user_event(("del", idx_list))
         except ValueError:
             logger.warning("删除队列：输入必须是数字，多个用空格隔开")
+            self.var_del.set("")
+            return
+        # 界面上队列序号从1开始，这里换算成任务列表下标
+        enqueue_user_event(("del", [x - 1 for x in idx_list]))
         self.var_del.set("")
     def poll_log(self):
         while True:
@@ -1012,6 +1034,8 @@ class DualWindowGUI:
                     ok_cat = (act_cat == sel_cat)
                 if ok_college and ok_cat:
                     show_list.append(it)
+            # 保存界面可见（筛选后）列表，供【②加入队列】按显示序号索引
+            self.current_show_list = list(show_list)
             lines = []
             lines.append("="*85)
             lines.append(f"📊 状态｜队列:{len(task_list)} 活跃线程:{len(worker_threads)} 偏移:{time_offset_ms}ms")
@@ -1020,7 +1044,7 @@ class DualWindowGUI:
                 lines.append("本轮没有活动")
             else:
                 now_ts_local = int(time.time()*1000)+time_offset_ms
-                for index, item in enumerate(show_list):
+                for index, item in enumerate(show_list, start=1):
                     aid = item.get("id")
                     name = item.get("name")
                     enrollable = item.get("isAbleEnroll", 0)
@@ -1072,19 +1096,19 @@ class DualWindowGUI:
                     lines.append(f"    活动：{act_start} ~ {act_end}")
                     lines.append("")
             lines.append("="*85)
-            lines.append("说明：输入多个序号用空格隔开；下拉筛选框切换自动刷新生效；⚠满额活动自动作为蹲守任务")
+            lines.append("说明：序号从1开始，输入多个序号用空格隔开；下拉筛选框切换自动刷新生效；⚠满额活动自动作为蹲守任务")
             self.txt_act.config(state=tk.NORMAL)
             self.txt_act.delete("1.0", tk.END)
             self.txt_act.insert(tk.END, "\n".join(lines))
             self.txt_act.see("1.0")
             self.txt_act.config(state=tk.DISABLED)
             q_lines = []
-            q_lines.append("序号 | 类型 | 活动名称")
+            q_lines.append("序号 | 类型 | 活动名称（序号从1开始）")
             q_lines.append("-"*50)
             if not task_list:
                 q_lines.append("暂无任务")
             else:
-                for q_idx, tsk in enumerate(task_list):
+                for q_idx, tsk in enumerate(task_list, start=1):
                     ttype = tsk.get("task_type","normal")
                     ttag = "[普通]" if ttype=="normal" else "[蹲守]"
                     q_lines.append(f"[{q_idx}] {ttag}  {tsk['name']}")
