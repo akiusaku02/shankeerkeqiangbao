@@ -4,6 +4,8 @@
 更新：
 1. 修复筛选后【加入队列】序号错用全量活动下标的问题：序号改为与筛选后显示列表一致，按活动ID加入
 2. 活动列表与抢报队列的序号统一改为从1开始
+3. 修复弹窗崩溃：显式导入tkinter.messagebox，抢报成功/蹲守结束弹窗不再AttributeError
+4. GUI轮询用try/finally保证after一定重排，异常不再导致日志与活动表格永久冻结；渲染队列改为非阻塞投递，避免后台主循环被写满阻塞
 """
 import requests
 import time
