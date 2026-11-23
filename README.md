@@ -7,7 +7,7 @@
 
 ## 环境要求
 1. 操作系统：Windows（脚本使用 Edge 浏览器登录，基于 tkinter 图形界面）
-2. Python 3.8 及以上版本（开发环境为 3.12）
+2. 建议Python 3.8 及以上3.12及以下版本（开发环境为 3.12）
 3. 安装第三方依赖库
 ```bash
 pip install requests selenium
@@ -17,7 +17,8 @@ pip install requests selenium
 
 ## 文件目录说明
 ```
-├─ launcher.exe      启动器（双击这个运行，不要直接点pyw）
+├─_internal
+├─ launcher.exe      启动器（双击这个运行，不要直接点pyw）    
 ├─ readme.txt        使用说明文档
 └─ app/
     └─ 山科第二课堂.pyw  主程序脚本
