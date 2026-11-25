@@ -1,11 +1,29 @@
 # -*- coding: utf-8 -*-
 """
-山科二课抢报脚本 v0.2.5
-更新：
-1. 修复筛选后【加入队列】序号错用全量活动下标的问题：序号改为与筛选后显示列表一致，按活动ID加入
-2. 活动列表与抢报队列的序号统一改为从1开始
-3. 修复弹窗崩溃：显式导入tkinter.messagebox，抢报成功/蹲守结束弹窗不再AttributeError
-4. GUI轮询用try/finally保证after一定重排，异常不再导致日志与活动表格永久冻结；渲染队列改为非阻塞投递，避免后台主循环被写满阻塞
+山科二课抢报脚本 v0.2.6
+本版修复（蹲守误报名 / 登录失效刷屏 / stored_authorization 不复用）：
+
+【令牌复用与凭证】
+1. 【复用不再自毁】复用分支 save_cred(store_stable_auth=False) 原会把手里的 stored_authorization 覆盖成空串，
+   等于复用一次就废掉持久令牌。现改为只刷新 Cookie，持久令牌原样保留。
+2. 【load_cred 解耦】stored_authorization 独立读取，不再受 Authorization/Cookie/VPN_BASE 任一为空的影响。
+3. 【失败来源分流】VPN 票据失效（返回 HTML / 401 / 403）只当“票据问题”，刷新 Cookie 即可，不再计入 token 失败次数；
+   只有业务返回 code:10001（登录失效）才计一次真实失效，连续 3 次才清空持久令牌。
+4. 【本地过期预判】Authorization 若为 JWT 且 exp 已过期，直接跳过复用走完整抓取；无 exp 的 token 视为可长期复用。
+5. 【指纹与时间】日志打印 token 指纹（前10…后6），cred.json 记录 stored_at（保存时间）与 last_ok_at（最近一次接口成功时间），
+   方便判断“是不是同一个 token”“存了多久”“最近还能不能用”。
+6. 【路径固定】cred.json / task.json 固定为脚本所在目录，避免不同工作目录读到两份凭证。
+
+【蹲守】
+7. 名额判定改用活动列表快照（详情接口不返回 peopleLimit / enrollCount，旧写法恒为 0 导致满额活动每轮误判“释放名额”）；
+   连续两轮确认才报名；字段缺失、isAbleEnroll=0、快照超 30s 未更新时一律不判定。
+
+【登录失效】
+8. 报名/详情接口返回 10001 时置位 relogin_event，由后台主循环统一重登一次并刷新 HEADERS，不再每 0.8s 空转刷屏。
+
+【失败退避】
+9. 蹲守报名失败后退避再判；普通抢报遇登录失效不消耗 SIGN_MAX_RETRY。
+保留 v0.2.5 的修复：筛选后序号映射、序号从1开始、弹窗导入、GUI 轮询健壮性
 """
 import requests
 import time
@@ -23,9 +41,11 @@ from queue import Queue, Empty
 # ===================== 配置 =====================
 MAX_LOG_ITEMS = 150        # 日志最大行数
 LOG_POLL_INTERVAL = 120    # 日志刷新间隔(ms)
-CRED_FILE = "cred.json"
-TASK_FILE = "task.json"
-TASK_TMP = "task.tmp.json"
+# ★ 凭证/任务文件固定在“脚本所在目录”，避免双击启动器与其他方式运行时 CWD 不同导致读到两份文件
+BASE_DIR = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else os.getcwd()
+CRED_FILE = os.path.join(BASE_DIR, "cred.json")
+TASK_FILE = os.path.join(BASE_DIR, "task.json")
+TASK_TMP = os.path.join(BASE_DIR, "task.tmp.json")
 FETCH_DAY_MAX = 30       # ✅抓取天数最大上限，在此修改
 FETCH_DAY_DEFAULT = 7     # ✅默认抓取天数
 empty_count = 0
@@ -36,6 +56,7 @@ SPRINT_ADVANCE_MS = 450
 SIGN_MAX_RETRY = 15
 WATCHDOG_MAX_RETRY = 1200   # 蹲守模式最大循环次数
 WATCHDOG_INTERVAL = 0.8     # 蹲守轮询间隔秒
+SNAPSHOT_STALE_SEC = 30     # 活动列表快照超过该秒数视为过期，蹲守不做名额判定（避免用旧数据误报）
 CACHE_TTL = 60
 MAX_DETAIL_CACHE = 200
 QUIET_COUNTDOWN = True      # 默认开启长倒计时静默
@@ -47,8 +68,12 @@ FILTER_LIMIT_COLLEGE = False
 BASE_BACKOFF = 0.15
 MAX_BACKOFF = 2.0
 ERKE_VPN_BASE = ""
-STABLE_AUTH_MAX_CONTINUE_FAIL = 3  # 连续复用旧Authorization失败次数，到达后清空持久缓存
-relogin_stable_auth_fail_count = 0 # 全局：复用token模式连续失败计数器
+STABLE_AUTH_MAX_CONTINUE_FAIL = 3  # 连续复用旧Authorization“验证失败”次数，到达后清空持久缓存
+relogin_stable_auth_fail_count = 0 # 全局：复用token已被业务接口确认失效(10001)的次数，不含VPN票据失效
+reused_stable_auth = False         # 当前运行的 Authorization 是否来自持久化复用（用于判定失败归属）
+vpn_ticket_fail_count = 0          # 全局：VPN 票据失效次数（只提示，不清持久token）
+last_ok_at_ms = 0                  # 全局：最近一次接口业务成功(code=0)的时间戳(ms)
+_last_ok_persist_ts = 0.0          # 全局：last_ok_at 最近一次落盘时间，避免频繁写文件
 DETAIL_RETRY = 2                   # 获取详情接口最大重试次数
 TASK_SAVE_INTERVAL = 5             # 后台循环多少次自动保存一次任务到磁盘
 # 窗口位置大小配置
@@ -73,6 +98,12 @@ exit_flag = threading.Event()
 # 任务停止标记字典 key: aid, value: threading.Event
 task_stop_flags = dict()
 task_stop_lock = threading.Lock()
+# 报名/详情接口返回登录失效时置位，由后台主循环统一重新登录（避免多线程各自弹窗/空转）
+relogin_event = threading.Event()
+# 活动列表快照（与界面显示同源）：key=str(aid)，value 含 peopleLimit/enrollCount/isAbleEnroll
+# 蹲守线程据此判定名额，详情接口不返回这两个字段
+activity_snapshot = dict()
+activity_snapshot_lock = threading.Lock()
 # 全局缓存：真正学院列表（名字以学院结尾）
 all_college_list = []
 # 学校二课固定5大活动分类
@@ -119,6 +150,25 @@ def safe_json_parse(resp):
     except ValueError:
         return None
 
+def to_int(v, default=-1):
+    """把接口字段安全转int；无法识别时返回default（蹲守判定用-1表示未知，绝不当作0）"""
+    if v is None or isinstance(v, bool):
+        return default
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        try:
+            return int(float(v))
+        except (TypeError, ValueError):
+            return default
+
+def is_auth_fail_code(code, msg=""):
+    """判断业务返回码是否为登录失效（10001 / 401 / 403 / 提示登陆失败）"""
+    msg = msg or ""
+    if str(code) in ("10001", "401", "403"):
+        return True
+    return ("登陆失败" in msg) or ("登录失败" in msg) or ("重新登陆" in msg) or ("重新登录" in msg)
+
 def popup_input_dialog(title: str, prompt_text: str, is_password=False):
     dialog = tk.Toplevel()
     dialog.title(title)
@@ -145,9 +195,27 @@ def popup_input_dialog(title: str, prompt_text: str, is_password=False):
     dialog.wait_window()
     return result_container["value"]
 
-def clear_stored_stable_auth():
+def token_fp(token: str) -> str:
+    """token 指纹：前10…后6，只用于日志核对是否为同一个 token，不输出完整内容"""
+    t = (token or "").strip()
+    if not t:
+        return "(空)"
+    if len(t) <= 20:
+        return t[:3] + "…" + t[-2:]
+    return f"{t[:10]}…{t[-6:]}"
+
+def _read_cred_file():
+    """读 cred.json，失败返回空dict"""
+    try:
+        with open(CRED_FILE, "r", encoding="utf-8") as f:
+            d = json.load(f)
+            return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+def clear_stored_stable_auth(reason: str = ""):
     """清空cred.json中的stored_authorization持久token缓存，增加文件损坏容错"""
-    global relogin_stable_auth_fail_count
+    global relogin_stable_auth_fail_count, reused_stable_auth
     with cred_lock:
         try:
             with open(CRED_FILE, "r", encoding="utf-8") as f:
@@ -156,13 +224,90 @@ def clear_stored_stable_auth():
             with open(CRED_FILE, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
             relogin_stable_auth_fail_count = 0
-            logger.warning("⚠️已清空持久Authorization缓存，下次登录强制完整抓取全新token")
+            reused_stable_auth = False
+            logger.warning(f"⚠️已清空持久Authorization缓存{('（' + reason + '）') if reason else ''}，下次登录强制完整抓取全新token")
         except (json.JSONDecodeError, IOError, Exception) as e:
             logger.warning(f"⚠️cred.json损坏或读取出错，重建空凭证文件:{e}")
             data = {"Authorization":"","Cookie":"","ERKE_VPN_BASE":"","stored_authorization":""}
             with open(CRED_FILE, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
             relogin_stable_auth_fail_count = 0
+            reused_stable_auth = False
+
+def mark_reused_auth_fail(msg: str = ""):
+    """复用来的 Authorization 被【业务层】确认失效（10001）时才累加计数。
+    注意：VPN 票据失效（HTML/401/403）不走这里，见 mark_vpn_ticket_fail。
+    """
+    global relogin_stable_auth_fail_count, reused_stable_auth
+    if not reused_stable_auth:
+        # 非复用 token（本次是完整抓取的）失效，只提示，不计入复用失败
+        logger.warning(f"⚠️当前Authorization被服务端判失效{('（' + msg + '）') if msg else ''}（非复用来源，不计入复用阈值）")
+        return
+    reused_stable_auth = False
+    relogin_stable_auth_fail_count += 1
+    logger.warning(f"⚠️复用Authorization验证失败{('（' + msg + '）') if msg else ''}，"
+                   f"计数 {relogin_stable_auth_fail_count}/{STABLE_AUTH_MAX_CONTINUE_FAIL}")
+    if relogin_stable_auth_fail_count >= STABLE_AUTH_MAX_CONTINUE_FAIL:
+        clear_stored_stable_auth("连续复用失败达到阈值")
+
+def mark_vpn_ticket_fail(msg: str = ""):
+    """VPN 票据/代理层失效（返回登录页 HTML、401、403）：只刷新 Cookie 即可，绝不清持久 token"""
+    global vpn_ticket_fail_count
+    vpn_ticket_fail_count += 1
+    logger.warning(f"🌐 VPN票据失效{('（' + msg + '）') if msg else ''}（第{vpn_ticket_fail_count}次）"
+                   f"，将只刷新Cookie复用token，持久Authorization保持不动")
+
+def mark_auth_ok(reason: str = ""):
+    """接口业务成功(code=0)：记录最近可用时间并（节流60秒）落盘，用于判断token是否仍然有效"""
+    global last_ok_at_ms, _last_ok_persist_ts
+    last_ok_at_ms = int(time.time() * 1000)
+    if time.time() - _last_ok_persist_ts < 60:
+        return
+    _last_ok_persist_ts = time.time()
+    with cred_lock:
+        data = _read_cred_file()
+        if not data:
+            return
+        data["last_ok_at"] = last_ok_at_ms
+        try:
+            with open(CRED_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+def token_expired_locally(token: str, margin_sec: int = 60) -> bool:
+    """若 Authorization 是 JWT，本地解析 exp 判断是否已过期。
+    本系统 token 不带 exp（只有签名+业务字段），因此恒返回 False → 视为可长期复用，交给服务端判定。
+    """
+    try:
+        parts = (token or "").split(".")
+        if len(parts) != 3:
+            return False
+        import base64
+        payload_b64 = parts[1] + "=" * (-len(parts[1]) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(payload_b64).decode("utf-8", "ignore"))
+        exp = payload.get("exp")
+        if isinstance(exp, (int, float)):
+            return time.time() + margin_sec >= float(exp)
+    except Exception:
+        return False
+    return False
+
+def fmt_age(ts_ms) -> str:
+    """把毫秒时间戳格式化成“已保存 N 天/小时/分钟”"""
+    try:
+        if not ts_ms or int(ts_ms) <= 0:
+            return "保存时间未知"
+        sec = time.time() - int(ts_ms) / 1000
+        if sec < 0:
+            return "时间异常"
+        if sec < 3600:
+            return f"已保存 {int(sec // 60)} 分钟"
+        if sec < 86400:
+            return f"已保存 {int(sec // 3600)} 小时"
+        return f"已保存 {int(sec // 86400)} 天"
+    except Exception:
+        return "保存时间未知"
 
 # ============= 业务工具函数 =============
 def parse_vpn_base_from_url(full_url: str):
@@ -176,39 +321,76 @@ def parse_vpn_base_from_url(full_url: str):
     return None
 
 def save_cred(auth, cookie, vpn_base, store_stable_auth:bool=True):
-    global ERKE_VPN_BASE, relogin_stable_auth_fail_count
+    """保存凭证。
+    store_stable_auth=True  ：完整登录拿到新 token，同时更新持久 Authorization
+    store_stable_auth=False ：只是复用旧 token、刷新 Cookie 票据，持久 Authorization 必须原样保留（旧版这里被写成空串）
+    """
+    global ERKE_VPN_BASE, relogin_stable_auth_fail_count, reused_stable_auth, last_ok_at_ms
     ERKE_VPN_BASE = vpn_base
     with cred_lock:
+        old = _read_cred_file()
+        old_stored = (old.get("stored_authorization") or "")
+        old_stored_at = old.get("stored_at") or 0
+        old_last_ok = old.get("last_ok_at") or 0
+        if store_stable_auth:
+            stored_out = auth
+            # 只有换成“不同的 token”才算新保存；同一 token 再走完整流程不重置保存时间
+            if stored_out and stored_out != old_stored:
+                stored_at = int(time.time() * 1000)
+            else:
+                stored_at = old_stored_at or int(time.time() * 1000)
+        else:
+            # 保留原持久令牌；万一旧文件里已经是空的，退回本次使用的 auth，保证下次仍有可复用令牌
+            stored_out = old_stored or auth
+            stored_at = old_stored_at or (int(time.time() * 1000) if stored_out else 0)
         data = {
             "Authorization": auth,
             "Cookie": cookie,
             "ERKE_VPN_BASE": vpn_base,
-            "stored_authorization": auth if store_stable_auth else ""
+            "stored_authorization": stored_out,
+            "stored_at": stored_at,
+            "last_ok_at": last_ok_at_ms or old_last_ok
         }
         with open(CRED_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
     if store_stable_auth:
-        logger.info("✅ 凭证&VPN代理地址已保存，已持久化存储Authorization用于后续复用")
+        logger.info(f"✅ 凭证&VPN代理地址已保存，已持久化存储Authorization用于后续复用"
+                    f"（fp:{token_fp(stored_out)}）")
         relogin_stable_auth_fail_count = 0 #完整抓取成功，重置失败计数器
+        reused_stable_auth = False        # 当前 token 是全新抓取的，不再属于“复用”
     else:
-        logger.info("✅ 凭证&VPN代理地址已保存（不更新持久Authorization，仅刷新Cookie票据）")
+        logger.info(f"✅ 凭证&VPN代理地址已保存（持久Authorization原样保留，仅刷新Cookie票据）"
+                    f"（fp:{token_fp(stored_out)}，{fmt_age(stored_at)}）")
 
 def load_cred():
-    global ERKE_VPN_BASE
+    """读取本地凭证。stored_authorization 独立返回：Authorization/Cookie 缺失时也不要把它一起丢掉"""
+    global ERKE_VPN_BASE, last_ok_at_ms
     try:
         with open(CRED_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-        auth = data.get("Authorization", "")
-        cookie = data.get("Cookie", "")
-        vpn_base = data.get("ERKE_VPN_BASE", "")
-        stored_auth = data.get("stored_authorization", "")
-        if auth and cookie and vpn_base:
-            ERKE_VPN_BASE = vpn_base
-            logger.info(f"✅ 读取本地缓存凭证，VPN_BASE:{ERKE_VPN_BASE}")
-            return auth, cookie, stored_auth
     except Exception:
         logger.info("ℹ️ 无缓存凭证，需要手动登录抓取")
-    return None, None, None
+        return None, None, None
+    auth = (data.get("Authorization") or "").strip()
+    cookie = (data.get("Cookie") or "").strip()
+    vpn_base = (data.get("ERKE_VPN_BASE") or "").strip()
+    stored_auth = (data.get("stored_authorization") or "").strip()
+    last_ok_at_ms = int(data.get("last_ok_at") or 0)
+    if vpn_base:
+        ERKE_VPN_BASE = vpn_base
+    if auth and cookie and vpn_base:
+        logger.info(f"✅ 读取本地缓存凭证，VPN_BASE:{ERKE_VPN_BASE}，token指纹:{token_fp(auth)}")
+        return auth, cookie, (stored_auth or None)
+    missing = []
+    if not auth:
+        missing.append("Authorization")
+    if not cookie:
+        missing.append("Cookie")
+    if not vpn_base:
+        missing.append("ERKE_VPN_BASE")
+    logger.warning(f"⚠️本地凭证不完整（缺少 {','.join(missing)}），需要重新登录；"
+                   f"持久Authorization仍保留（fp:{token_fp(stored_auth)}）可用于复用判定")
+    return None, None, (stored_auth or None)
 
 def get_api_url(api_path: str):
     if not ERKE_VPN_BASE:
@@ -275,10 +457,12 @@ def http_get(session: requests.Session, url, timeout=10):
         # 检测WebVPN返回HTML登录页面
         txt_sample = resp.text[:300]
         if "<!DOCTYPE html>" in txt_sample or "<html" in txt_sample:
-            logger.warning("❗检测返回HTML页面，判定凭证/VPN票据失效，需要重登录")
+            logger.warning("❗检测返回HTML页面，判定VPN票据失效（token保持不动），需要重登录")
+            mark_vpn_ticket_fail("GET 返回登录页")
             return resp, True
         if resp.status_code in (401, 403):
-            logger.error("❗ 接口返回 401/403，凭证失效")
+            logger.error("❗ 接口返回 401/403，VPN票据失效")
+            mark_vpn_ticket_fail(f"GET {resp.status_code}")
             return resp, True
         empty_count = 0
         return resp, False
@@ -296,10 +480,12 @@ def http_post(session: requests.Session, url, json_data, timeout=3):
             time.sleep(2.0)
         txt_sample = resp.text[:300]
         if "<!DOCTYPE html>" in txt_sample or "<html" in txt_sample:
-            logger.warning("❗POST检测返回HTML页面，VPN票据失效，需要重登录")
+            logger.warning("❗POST检测返回HTML页面，VPN票据失效（token保持不动），需要重登录")
+            mark_vpn_ticket_fail("POST 返回登录页")
             return resp, True
         if resp.status_code in (401, 403):
-            logger.error("❗ POST 返回 401/403，凭证失效")
+            logger.error("❗ POST 返回 401/403，VPN票据失效")
+            mark_vpn_ticket_fail(f"POST {resp.status_code}")
             return resp, True
         return resp, False
     except Exception as e:
@@ -325,6 +511,7 @@ def fetch_dept_dict(session):
         all_college_list = []
         return {}, False
     if ret.get("code") == 0:
+        mark_auth_ok("学院字典")
         d = {}
         all_college_list = []
         for item in ret["data"]:
@@ -341,7 +528,7 @@ def fetch_dept_dict(session):
         return {}, False
 
 def manual_login_get_token():
-    global relogin_stable_auth_fail_count
+    global relogin_stable_auth_fail_count, reused_stable_auth
     from selenium import webdriver
     from selenium.webdriver.edge.options import Options
     edge_options = Options()
@@ -373,11 +560,22 @@ def manual_login_get_token():
         vpn_base = parse_vpn_base_from_url(current_url)
         if not vpn_base:
             raise Exception("解析WebVPN代理地址失败，请确认页面是二课系统页面")
-        # 判断：有持久token 并且 连续失败计数没有超过阈值，才复用token只刷cookie
-        if stored_stable_auth and stored_stable_auth.strip() and relogin_stable_auth_fail_count < STABLE_AUTH_MAX_CONTINUE_FAIL:
+        # 判断：有持久token 且 该token本地未过期 且 复用失败计数未超阈值，才复用token只刷cookie
+        reuse_allowed = bool(
+            stored_stable_auth
+            and stored_stable_auth.strip()
+            and relogin_stable_auth_fail_count < STABLE_AUTH_MAX_CONTINUE_FAIL
+        )
+        if reuse_allowed and token_expired_locally(stored_stable_auth.strip()):
+            logger.warning("⚠️持久Authorization已过期（JWT exp 已过），跳过复用直接完整抓取")
+            reuse_allowed = False
+        if reuse_allowed:
             auth_token = stored_stable_auth.strip()
-            relogin_stable_auth_fail_count += 1
-            logger.info(f"✅ 复用本地持久Authorization，仅刷新WebVPN Cookie票据！连续复用失败计数:{relogin_stable_auth_fail_count}/{STABLE_AUTH_MAX_CONTINUE_FAIL}")
+            # 不在此累加失败计数：只有“复用后业务层确认失效(10001)”才算一次失败（见 mark_reused_auth_fail）
+            reused_stable_auth = True
+            saved = _read_cred_file()
+            logger.info(f"♻️ 复用持久token（fp:{token_fp(auth_token)}，{fmt_age(saved.get('stored_at'))}），"
+                        f"仅刷新WebVPN Cookie票据；已确认失效计数:{relogin_stable_auth_fail_count}/{STABLE_AUTH_MAX_CONTINUE_FAIL}")
             cookies = driver.get_cookies()
             cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
             save_cred(auth_token, cookie_str, vpn_base, store_stable_auth=False)
@@ -470,6 +668,7 @@ def fetch_all_days(session, fetch_day_count):
             logger.error(f"❌ 第{d}天业务异常 code={data.get('code')}, msg={data.get('msg')}")
             continue
         list_act = data.get("data", {}).get("list", [])
+        mark_auth_ok("活动列表")
         all_acts.extend(list_act)
     unique_acts = {}
     for act in all_acts:
@@ -513,11 +712,19 @@ def get_activity_detail(session, act_id, detail_cache: dict):
                 logger.warning(f"详情接口返回非JSON aid={act_id}，已用尽重试")
                 return {}, False
         if ret.get("code") == 0:
+            mark_auth_ok("活动详情")
             d = ret.get("data", {})
             detail_cache[act_id] = {"data": d, "cache_time": now}
             return d, False
         else:
-            logger.warning(f"详情接口返回错误 aid={act_id} code={ret.get('code')} msg={ret.get('msg')}")
+            code = ret.get("code")
+            msg = ret.get("msg", "")
+            if is_auth_fail_code(code, msg):
+                logger.warning(f"🔑 详情接口登录失效 aid={act_id} code={code} msg={msg}")
+                mark_reused_auth_fail(f"详情接口 {code}")
+                relogin_event.set()
+                return {}, True
+            logger.warning(f"详情接口返回错误 aid={act_id} code={code} msg={msg}")
             return {}, False
     return {}, False
 
@@ -530,13 +737,14 @@ def fmt_ts(ts):
         return "无效时间"
 
 def sign_up(session, act_id, act_name, retry_count):
-    """沿用旧版稳定网页报名接口，不改动"""
+    """报名接口。返回 (ok, need_relogin)；登录失效时置位 relogin_event 交由后台统一重新登录"""
     payload = {"activityId": act_id}
     url = get_api_url("/api/app/client/v1/activity/enroll")
     backoff = min(BASE_BACKOFF * (2**retry_count), MAX_BACKOFF)
     time.sleep(random.uniform(backoff*0.6, backoff*1.2))
     resp, need_relogin = http_post(session, url, payload, timeout=3)
     if need_relogin:
+        relogin_event.set()
         return False, True
     if resp is None:
         return False, False
@@ -544,13 +752,24 @@ def sign_up(session, act_id, act_name, retry_count):
     if ret is None:
         logger.warning(f"报名接口返回非JSON【{act_name}】")
         return False, False
-    if ret.get("code") == 0:
+    code = ret.get("code")
+    msg = ret.get("msg", "")
+    if code == 0:
+        mark_auth_ok("报名")
         logger.info(f"✅【报名成功】{act_name} id:{act_id}")
         enqueue_user_event(("popup_msg","抢报成功",f"活动：{act_name}\nID:{act_id}"))
         return True, False
-    else:
-        logger.warning(f"⚠️【报名失败】{act_name} | code:{ret.get('code')} msg:{ret.get('msg')}")
+    if is_auth_fail_code(code, msg):
+        # 凭证失效：只报一次，交给后台主循环重新登录，避免每 0.8s 反复刷同一条错误
+        logger.warning(f"🔑【{act_name}】报名接口返回登录失效 code:{code} msg:{msg}，已请求重新登录")
+        mark_reused_auth_fail(f"报名接口 {code}")
+        relogin_event.set()
+        return False, True
+    if msg and ("已满" in msg or "名额" in msg):
+        logger.warning(f"⚠️【报名失败】{act_name} | 名额已满（{msg}），等列表快照更新后再判")
         return False, False
+    logger.warning(f"⚠️【报名失败】{act_name} | code:{code} msg:{msg}")
+    return False, False
 
 def sprint_worker(headers_ref, task, task_list_lock, task_list, task_id_set, stop_flag: threading.Event):
     aid = task["id"]
@@ -561,6 +780,7 @@ def sprint_worker(headers_ref, task, task_list_lock, task_list, task_id_set, sto
     logger.info(f"⏰ {'[普通抢报]' if task_type=='normal' else '[蹲守]'}开始盯防【{name}】，报名开始: {fmt_ts(enroll_start_ts)}")
     retry_cnt = 0
     watchdog_cnt = 0
+    free_hit = False       # 蹲守：是否已检测到一次释放名额（用于二次确认）
     try:
         while not exit_flag.is_set() and not stop_flag.is_set():
             now_ts = int(time.time() * 1000) + time_offset_ms
@@ -574,6 +794,10 @@ def sprint_worker(headers_ref, task, task_list_lock, task_list, task_id_set, sto
                     ok, need_relogin = sign_up(sess, aid, name, retry_cnt)
                     if ok:
                         break
+                    if need_relogin:
+                        # 登录失效不算抢报重试次数，等后台主循环重新登录后再打
+                        time.sleep(2.0)
+                        continue
                     retry_cnt += 1
                     if retry_cnt >= SIGN_MAX_RETRY:
                         logger.warning(f"❌【{name}】抢报达到最大重试次数，放弃")
@@ -594,20 +818,64 @@ def sprint_worker(headers_ref, task, task_list_lock, task_list, task_id_set, sto
                     enqueue_user_event(("popup_msg","蹲守任务结束",f"活动 {name}\n达到最大蹲守轮数，自动停止"))
                     break
                 sess = get_thread_session(headers_ref.copy())
+                # 用详情确认活动仍在报名期/未被下架（详情不含 peopleLimit、enrollCount）
                 detail, relog = get_activity_detail(sess, aid, dict())
                 if relog:
-                    time.sleep(WATCHDOG_INTERVAL)
+                    logger.warning(f"🔑【{name}】蹲守查询登录失效，暂停等待重新登录")
+                    time.sleep(3.0)
                     continue
                 if not detail:
                     time.sleep(WATCHDOG_INTERVAL)
                     continue
-                pl = detail.get("peopleLimit",0)
-                ec = detail.get("enrollCount",0)
-                if pl>0 and ec < pl:
-                    logger.info(f"🎉【{name}】检测到释放名额！立即发起报名")
+                # ★ 名额判定改用活动列表快照（与界面显示同源），不再从 detail 取 enrollCount
+                with activity_snapshot_lock:
+                    snap = dict(activity_snapshot.get(str(aid)) or {})
+                if not snap:
+                    # 列表里暂时没有这条活动（翻页/掉出抓取范围），本轮不判定，避免误报
+                    free_hit = False
+                    time.sleep(WATCHDOG_INTERVAL)
+                    continue
+                if time.time() - snap.get("update_time", 0) > SNAPSHOT_STALE_SEC:
+                    free_hit = False
+                    if watchdog_cnt % 20 == 1:
+                        logger.info(f"ℹ️【{name}】列表快照超过 {SNAPSHOT_STALE_SEC}s 未更新，暂不判定名额（继续蹲守中）")
+                    time.sleep(WATCHDOG_INTERVAL)
+                    continue
+                pl = to_int(snap.get("peopleLimit"), -1)
+                ec = to_int(snap.get("enrollCount"), -1)
+                able = to_int(snap.get("isAbleEnroll"), -1)
+                if pl <= 0 or ec < 0:
+                    # 字段缺失/不限人数：名额未知，不做判定
+                    free_hit = False
+                    time.sleep(WATCHDOG_INTERVAL)
+                    continue
+                if able == 0:
+                    # 列表明确标记不可报名：即使 ec<pl 也不报
+                    free_hit = False
+                    if watchdog_cnt % 20 == 1:
+                        logger.info(f"ℹ️【{name}】列表标记不可报名（{ec}/{pl}），继续蹲守")
+                    time.sleep(WATCHDOG_INTERVAL)
+                    continue
+                if ec < pl:
+                    if not free_hit:
+                        # 第一次命中：只记录，下一轮再确认，避免单次脏数据误报
+                        free_hit = True
+                        logger.info(f"🔎【{name}】检测到名额 {ec}/{pl}，等待再次确认…")
+                        time.sleep(WATCHDOG_INTERVAL)
+                        continue
+                    logger.info(f"🎉【{name}】二次确认有名额 {ec}/{pl}，立即发起报名")
                     ok, need_relogin = sign_up(sess, aid, name, 0)
                     if ok:
                         break
+                    free_hit = False
+                    if need_relogin:
+                        logger.warning(f"🔑【{name}】报名被拒（登录失效），等待后台重新登录后再蹲守")
+                        time.sleep(3.0)
+                        continue
+                    logger.info(f"⏳【{name}】报名未成功，退避后再判（可能是残余名额被抢走或接口拒绝）")
+                    time.sleep(max(WATCHDOG_INTERVAL, 2.5))
+                    continue
+                free_hit = False
                 time.sleep(WATCHDOG_INTERVAL)
     except Exception as e:
         logger.error(f"❌ sprint_worker 线程异常【{name}】: {e}")
@@ -633,6 +901,10 @@ def backend_loop():
         AUTHORIZATION, COOKIE_STR, STORED_STABLE_AUTH = load_cred()
         if not AUTHORIZATION or not COOKIE_STR:
             AUTHORIZATION, COOKIE_STR = manual_login_get_token()
+        if STORED_STABLE_AUTH:
+            saved = _read_cred_file()
+            logger.info(f"ℹ️ 持久token：fp:{token_fp(STORED_STABLE_AUTH)}，{fmt_age(saved.get('stored_at'))}，"
+                        f"最近可用 {fmt_ts(saved.get('last_ok_at'))}")
         HEADERS = {
             "Accept": "*/*",
             "Accept-Encoding": "gzip, deflate, br, zstd",
@@ -644,7 +916,7 @@ def backend_loop():
         }
         main_session = requests.Session()
         main_session.headers.update(HEADERS)
-        logger.info("✅【v0.2.5】后台监控启动（报名接口保持旧网页版）")
+        logger.info("✅【v0.2.6】后台监控启动（蹲守快照判定 / 持久token复用 / 失败来源分流）")
         dept_dict, need_relogin = fetch_dept_dict(main_session)
         if need_relogin:
             AUTHORIZATION, COOKIE_STR = manual_login_get_token()
@@ -675,6 +947,24 @@ def backend_loop():
             if loop_counter % TASK_SAVE_INTERVAL ==0:
                 save_tasks_atomic(task_list, task_list_lock)
 
+            # ★ 报名/详情接口报登录失效（code:10001）时，由后台统一重新登录一次，所有线程同步生效
+            if relogin_event.is_set():
+                relogin_event.clear()
+                logger.warning("🔑 检测到登录失效，开始重新登录（请在弹出的浏览器窗口完成 WebVPN 操作）")
+                try:
+                    AUTHORIZATION, COOKIE_STR = manual_login_get_token()
+                    HEADERS["Authorization"] = AUTHORIZATION
+                    HEADERS["Cookie"] = COOKIE_STR
+                    main_session.headers.update(HEADERS)
+                    empty_count = 0
+                    cached_dept_dict, _ = fetch_dept_dict(main_session)
+                    detail_cache.clear()
+                    logger.info(f"✅ 重新登录完成，盯防线程将自动恢复报名（当前token fp:{token_fp(AUTHORIZATION)}）")
+                except Exception as e:
+                    logger.error(f"❌ 重新登录失败：{e}，30秒后重试")
+                    time.sleep(30)
+                    relogin_event.set()
+                    continue
             if empty_count >= max_empty:
                 logger.warning(f"连续空返回达到 {max_empty} 次，尝试重新登录")
                 AUTHORIZATION, COOKIE_STR = manual_login_get_token()
@@ -743,6 +1033,22 @@ def backend_loop():
                 detail_cache.clear()
                 continue
             cached_raw_activities = valid_activities
+            # ★ 发布活动列表快照（与界面/加入队列同源），供蹲守线程判定名额
+            #   合并更新而非整体清空：蹲守中的活动即使本轮掉出抓取列表，也能保留最近一次可信数据
+            snap_now = time.time()
+            with activity_snapshot_lock:
+                for it in valid_activities:
+                    activity_snapshot[str(it.get("id"))] = {
+                        "peopleLimit": it.get("peopleLimit", None),
+                        "enrollCount": it.get("enrollCount", None),
+                        "isAbleEnroll": it.get("isAbleEnroll", None),
+                        "enrollEndTime": it.get("enrollEndTime", 0),
+                        "name": it.get("name", ""),
+                        "update_time": snap_now,
+                    }
+                for k in list(activity_snapshot.keys()):
+                    if snap_now - activity_snapshot[k].get("update_time", 0) > 600:
+                        del activity_snapshot[k]
             if gui_event is not None:
                 ev_type, ev_data = gui_event
                 if ev_type == "refresh":
@@ -765,8 +1071,11 @@ def backend_loop():
                             continue
                         enroll_start_ts = selected.get("enrollStartTime")
                         enroll_end_ts = real_detail.get("enrollEndTime", selected.get("enrollEndTime",0))
-                        peopleLimit = selected.get("peopleLimit",0)
-                        enrollCount = selected.get("enrollCount",0)
+                        # 名额数据以活动列表项为准（详情接口不返回 peopleLimit/enrollCount）
+                        peopleLimit = to_int(selected.get("peopleLimit"), 0)
+                        enrollCount = to_int(selected.get("enrollCount"), 0)
+                        if peopleLimit <= 0:
+                            logger.warning(f"⚠️【{name}】列表未返回有效人数上限（peopleLimit={selected.get('peopleLimit')}），按普通抢报处理")
                         now_ts_local = int(time.time()*1000)+time_offset_ms
                         is_end = bool(enroll_end_ts and now_ts_local >= enroll_end_ts)
                         if is_end:
@@ -779,9 +1088,19 @@ def backend_loop():
                         task_type = "normal"
                         if is_full:
                             task_type = "watchdog"
-                            logger.info(f"⚠️【{name}】名额已满，将作为蹲守任务，等待有人退报释放名额")
+                            logger.info(f"⚠️【{name}】名额已满（{enrollCount}/{peopleLimit}），将作为蹲守任务，等待有人退报释放名额")
                         else:
-                            logger.info(f"✅【{name}】加入{'普通抢报' if task_type=='normal' else '蹲守'}队列")
+                            logger.info(f"✅【{name}】加入普通抢报队列（名额 {enrollCount}/{peopleLimit}）")
+                        # 同步刷新快照，蹲守线程启动即可拿到可信数据
+                        with activity_snapshot_lock:
+                            activity_snapshot[str(aid)] = {
+                                "peopleLimit": selected.get("peopleLimit", None),
+                                "enrollCount": selected.get("enrollCount", None),
+                                "isAbleEnroll": selected.get("isAbleEnroll", None),
+                                "enrollEndTime": enroll_end_ts,
+                                "name": name,
+                                "update_time": time.time(),
+                            }
                         new_task = {
                             "id":aid,
                             "name":name,
